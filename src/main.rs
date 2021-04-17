@@ -21,18 +21,17 @@ use stm32f1xx_hal::{gpio, pac,
 use stm32f1xx_hal::gpio::{Output, State};
 
 use embedded_hal::digital::v2::OutputPin;
-use embedded_hal::blocking::i2c::Write;
 use pac::I2C1;
 use rtic::{app};
 use rtic::cyccnt::{Instant, U32Ext};
 use heapless::{String, consts::*};
 use embedded_graphics::{
-    fonts::{Font6x8, Text},
+    fonts::{Font12x16, Text},
     pixelcolor::BinaryColor,
     prelude::*,
     style::TextStyle,
 };
-
+use core::fmt::Write;
 use sh1106::{prelude::*, Builder};
 use sh1106::interface::{I2cInterface, DisplayInterface};
 use sh1106::mode::displaymode::DisplayModeTrait;
@@ -42,8 +41,10 @@ type Sda = gpio::gpiob::PB9<gpio::Alternate<gpio::OpenDrain>>;
 type Scl = gpio::gpiob::PB8<gpio::Alternate<gpio::OpenDrain>>;
 
 type OledDisplay = GraphicsMode<
-    I2cInterface<I2c<I2C1, (Scl, Sda)>>,
+    I2cInterface<BlockingI2c<I2C1, (Scl, Sda)>>,
 >;
+
+// type OledDisplay = I2cInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>, PB9<Alternate<OpenDrain>>)>>;
 
 const PERIOD: u32 = 8_000_000; // period of periodic task execution
 
@@ -117,8 +118,8 @@ const APP: () = {
             year: 2021,
             month: 4,
             day: 17,
-            hour: 11,
-            min: 10,
+            hour: 17,
+            min: 24,
             sec: 00,
             day_of_week: datetime::DayOfWeek::Saturday,
         };
@@ -128,7 +129,7 @@ const APP: () = {
 
         rtc.listen_seconds();
         //
-        let mut display = Builder::new().connect_i2c(i2c).into();
+        let mut display: GraphicsMode<_> = Builder::new().connect_i2c(i2c).into();
         display.init().unwrap();
         display.flush().unwrap();
 
@@ -154,7 +155,7 @@ const APP: () = {
     //         .unwrap();
     // }
 
-    #[task(resources=[led, logger, rtc], schedule=[rtc_test])]
+    #[task(resources=[led, logger, rtc, display], schedule=[rtc_test])]
     fn rtc_test(c: rtc_test::Context) {
 
         static mut LED_STATE: bool = false;
@@ -171,6 +172,12 @@ const APP: () = {
         let mut out: String<U256> = String::new();
         let datetime = DateTime::new(c.resources.rtc.current_time());
         write!(&mut out, "{}", datetime).unwrap();
+        Text::new(&out, Point::new(0, 4))
+            .into_styled(TextStyle::new(Font12x16, BinaryColor::On))
+            .draw(c.resources.display)
+            .unwrap();
+        c.resources.display.flush().unwrap();
+        c.resources.display.clear();
         c.resources.logger.log(&out);
 
         c.schedule.rtc_test(c.scheduled + PERIOD.cycles()).unwrap();
