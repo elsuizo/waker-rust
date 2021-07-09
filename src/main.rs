@@ -1,3 +1,12 @@
+//----------------------------------------------------------------------------
+// @date 2021-07-08
+// @author Martin Noblia
+// TODOs
+// - [X] verificar que ande la hora bien
+// - [X] verificar que el oled funciona bien y mostrar la hora
+// - [ ] hacer el menu con el display
+//  - [ ] que cambie la hora con los botones
+//----------------------------------------------------------------------------
 #![deny(unsafe_code)]
 // #![deny(warnings)]
 #![no_main]
@@ -10,39 +19,40 @@ extern crate panic_semihosting;
 // use core::fmt::Write;
 use cortex_m::peripheral::DWT;
 // TODO(elsuizo:2021-03-25): this is a mess
-use stm32f1xx_hal::{gpio, pac,
+use stm32f1xx_hal::{
+    gpio,
+    i2c::{BlockingI2c, DutyCycle, I2c, Mode},
+    pac,
+    prelude::*,
     rtc::Rtc,
-    i2c::{BlockingI2c, DutyCycle, Mode, I2c},
-    time::Hertz,
+    serial::{self, Config, Serial},
     stm32,
-    serial::{self, Serial, Config},
-    prelude::*};
+    time::Hertz,
+};
 
 use stm32f1xx_hal::gpio::{Output, State};
 
-use embedded_hal::digital::v2::OutputPin;
-use pac::I2C1;
-use rtic::{app};
-use rtic::cyccnt::{Instant, U32Ext};
-use heapless::{String, consts::*};
+use core::fmt::Write;
 use embedded_graphics::{
     fonts::{Font12x16, Text},
     pixelcolor::BinaryColor,
     prelude::*,
     style::TextStyle,
 };
-use core::fmt::Write;
-use sh1106::{prelude::*, Builder};
-use sh1106::interface::{I2cInterface, DisplayInterface};
+use embedded_hal::digital::v2::OutputPin;
+use heapless::{consts::*, String};
+use pac::I2C1;
+use rtic::app;
+use rtic::cyccnt::{Instant, U32Ext};
+use sh1106::interface::{DisplayInterface, I2cInterface};
 use sh1106::mode::displaymode::DisplayModeTrait;
+use sh1106::{prelude::*, Builder};
 
 type Led = gpio::gpioc::PC13<gpio::Output<gpio::PushPull>>;
 type Sda = gpio::gpiob::PB9<gpio::Alternate<gpio::OpenDrain>>;
 type Scl = gpio::gpiob::PB8<gpio::Alternate<gpio::OpenDrain>>;
 
-type OledDisplay = GraphicsMode<
-    I2cInterface<BlockingI2c<I2C1, (Scl, Sda)>>,
->;
+type OledDisplay = GraphicsMode<I2cInterface<BlockingI2c<I2C1, (Scl, Sda)>>>;
 
 // type OledDisplay = I2cInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>, PB9<Alternate<OpenDrain>>)>>;
 
@@ -54,7 +64,7 @@ const APP: () = {
         led: Led,
         display: OledDisplay,
         rtc: Rtc,
-        logger: logger::Logger
+        logger: logger::Logger,
     }
 
     #[init(schedule=[rtc_test])]
@@ -63,9 +73,9 @@ const APP: () = {
         core.DWT.enable_cycle_counter();
         // cx.core.DCB.enable_trace();
         let mut flash = cx.device.FLASH.constrain();
-        let mut rcc   = cx.device.RCC.constrain();
-        let mut afio  = cx.device.AFIO.constrain(&mut rcc.apb2);
-        let mut pwr   = cx.device.PWR;
+        let mut rcc = cx.device.RCC.constrain();
+        let mut afio = cx.device.AFIO.constrain(&mut rcc.apb2);
+        let mut pwr = cx.device.PWR;
         let mut backup_domain = rcc.bkp.constrain(cx.device.BKP, &mut rcc.apb1, &mut pwr);
         let clocks = rcc
             .cfgr
@@ -81,6 +91,7 @@ const APP: () = {
         // USART1
         let tx = gpiob.pb6.into_alternate_push_pull(&mut gpiob.crl);
         let rx = gpiob.pb7;
+        let mut out: String<U256> = String::new();
         // Set up the usart device. Taks ownership over the USART register and tx/rx pins. The rest of
         // the registers are used to enable and configure the device.
         let mut serial = Serial::usart1(
@@ -134,8 +145,7 @@ const APP: () = {
         display.flush().unwrap();
 
         let tx = serial.split().0;
-        let logger = logger::Logger::new(tx);
-
+        let mut logger = logger::Logger::new(tx);
         cx.schedule.rtc_test(cx.start + PERIOD.cycles()).unwrap();
 
         // resources
@@ -143,7 +153,7 @@ const APP: () = {
             led,
             display,
             rtc,
-            logger
+            logger,
         }
     }
 
@@ -157,18 +167,17 @@ const APP: () = {
 
     #[task(resources=[led, logger, rtc, display], schedule=[rtc_test])]
     fn rtc_test(c: rtc_test::Context) {
-
         static mut LED_STATE: bool = false;
         // c.resources.rtc.clear_second_flag();
         // c.resources.rtc.listen_seconds();
 
-        if *LED_STATE {
-            c.resources.led.set_high().unwrap();
-            *LED_STATE = false;
-        } else {
-            c.resources.led.set_low().unwrap();
-            *LED_STATE = true;
-        }
+        // if *LED_STATE {
+        //     c.resources.led.set_high().unwrap();
+        //     *LED_STATE = false;
+        // } else {
+        //     c.resources.led.set_low().unwrap();
+        //     *LED_STATE = true;
+        // }
         let mut out: String<U256> = String::new();
         let datetime = DateTime::new(c.resources.rtc.current_time());
         write!(&mut out, "{}", datetime).unwrap();
