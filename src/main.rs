@@ -12,8 +12,13 @@
 #![no_main]
 #![no_std]
 
+mod button;
 mod datetime;
 mod logger;
+mod menu;
+
+use menu::*;
+
 use datetime::DateTime;
 extern crate panic_semihosting;
 // use core::fmt::Write;
@@ -28,6 +33,7 @@ use stm32f1xx_hal::{
     serial::{self, Config, Serial},
     stm32,
     time::Hertz,
+    timer,
 };
 
 use stm32f1xx_hal::gpio::{Output, State};
@@ -51,10 +57,11 @@ use sh1106::{prelude::*, Builder};
 type Led = gpio::gpioc::PC13<gpio::Output<gpio::PushPull>>;
 type Sda = gpio::gpiob::PB9<gpio::Alternate<gpio::OpenDrain>>;
 type Scl = gpio::gpiob::PB8<gpio::Alternate<gpio::OpenDrain>>;
+type Button0Pin = gpio::gpioa::PA6<gpio::Input<gpio::PullUp>>;
+type Button1Pin = gpio::gpioa::PA7<gpio::Input<gpio::PullUp>>;
+type Button2Pin = gpio::gpiob::PB0<gpio::Input<gpio::PullUp>>;
 
 type OledDisplay = GraphicsMode<I2cInterface<BlockingI2c<I2C1, (Scl, Sda)>>>;
-
-// type OledDisplay = I2cInterface<BlockingI2c<I2C1, (PB8<Alternate<OpenDrain>>, PB9<Alternate<OpenDrain>>)>>;
 
 const PERIOD: u32 = 8_000_000; // period of periodic task execution
 
@@ -65,10 +72,13 @@ const APP: () = {
         display: OledDisplay,
         rtc: Rtc,
         logger: logger::Logger,
+        button0: button::Button<Button0Pin>,
+        timer: timer::CountDownTimer<stm32::TIM3>,
+        display_fsm: menu::DisplayStateMachine,
     }
 
     #[init(schedule=[rtc_test])]
-    fn init(mut cx: init::Context) -> init::LateResources {
+    fn init(cx: init::Context) -> init::LateResources {
         let mut core = cx.core;
         core.DWT.enable_cycle_counter();
         // cx.core.DCB.enable_trace();
@@ -83,6 +93,7 @@ const APP: () = {
             .sysclk(72.mhz())
             .pclk1(36.mhz())
             .freeze(&mut flash.acr);
+        let mut gpioa = cx.device.GPIOA.split(&mut rcc.apb2);
         let mut gpiob = cx.device.GPIOB.split(&mut rcc.apb2);
         let mut gpioc = cx.device.GPIOC.split(&mut rcc.apb2);
         // oled pins
@@ -91,7 +102,6 @@ const APP: () = {
         // USART1
         let tx = gpiob.pb6.into_alternate_push_pull(&mut gpiob.crl);
         let rx = gpiob.pb7;
-        let mut out: String<U256> = String::new();
         // Set up the usart device. Taks ownership over the USART register and tx/rx pins. The rest of
         // the registers are used to enable and configure the device.
         let mut serial = Serial::usart1(
@@ -107,6 +117,12 @@ const APP: () = {
             .into_push_pull_output_with_state(&mut gpioc.crh, State::Low);
         led.set_high().unwrap();
 
+        // timer setup
+        let mut timer =
+            timer::Timer::tim3(cx.device.TIM3, &clocks, &mut rcc.apb1).start_count_down(1.khz());
+        timer.listen(timer::Event::Update);
+
+        // display setup
         let i2c = BlockingI2c::i2c1(
             cx.device.I2C1,
             (scl, sda),
@@ -122,6 +138,9 @@ const APP: () = {
             1000,
             1000,
         );
+        let mut display: GraphicsMode<_> = Builder::new().connect_i2c(i2c).into();
+        display.init().unwrap();
+        display.flush().unwrap();
 
         // real time clock initialization
         let mut rtc = Rtc::rtc(cx.device.RTC, &mut backup_domain);
@@ -139,35 +158,45 @@ const APP: () = {
         }
 
         rtc.listen_seconds();
-        //
-        let mut display: GraphicsMode<_> = Builder::new().connect_i2c(i2c).into();
-        display.init().unwrap();
-        display.flush().unwrap();
 
         let tx = serial.split().0;
         let mut logger = logger::Logger::new(tx);
         cx.schedule.rtc_test(cx.start + PERIOD.cycles()).unwrap();
 
+        // buttons
+        let button0_pin = gpioa.pa6.into_pull_up_input(&mut gpioa.crl);
+        let button1_pin = gpioa.pa7.into_pull_up_input(&mut gpioa.crl);
+        let button2_pin = gpiob.pb0.into_pull_up_input(&mut gpiob.crl);
+
+        let display_fsm = DisplayStateMachine::init(DisplayState::Row1);
         // resources
         init::LateResources {
             led,
             display,
             rtc,
             logger,
+            button0: button::Button::new(button0_pin),
+            timer,
+            display_fsm,
         }
     }
 
-    // #[task(resources=[display])]
-    // fn show_text(c: show_text::Context) {
-    //     Text::new("Hello world!", Point::zero())
-    //         .into_styled(TextStyle::new(Font6x8, BinaryColor::On))
-    //         .draw(&mut c.resources.display)
-    //         .unwrap();
-    // }
+    #[task(binds = TIM3, priority = 4, spawn = [ui], resources = [button0, timer])]
+    fn tick(c: tick::Context) {
+        c.resources.timer.clear_update_interrupt_flag();
+
+        if let button::Event::Pressed = c.resources.button0.poll() {
+            c.spawn.ui(menu::Message::Down);
+        }
+    }
+
+    #[task(resources=[display_fsm])]
+    fn ui(c: ui::Context, msg: menu::Message) {
+        c.resources.display_fsm.dispatch(msg);
+    }
 
     #[task(resources=[led, logger, rtc, display], schedule=[rtc_test])]
     fn rtc_test(c: rtc_test::Context) {
-        static mut LED_STATE: bool = false;
         // c.resources.rtc.clear_second_flag();
         // c.resources.rtc.listen_seconds();
 
