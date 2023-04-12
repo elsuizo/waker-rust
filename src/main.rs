@@ -1,155 +1,165 @@
 //----------------------------------------------------------------------------
-// @date 2021-07-08
+// @date 2021-11-13
 // @author Martin Noblia
 // TODOs
-// - [X] verificar que ande la hora bien
-// - [X] verificar que el oled funciona bien y mostrar la hora
-// - [ ] hacer el menu con el display
-//  - [ ] que cambie la hora con los botones
+// - [X] Periodic task blinky compile and working
+// - [X] include the oled display
+// - [X] do the menu with buttons
+// - [X] enable UART debug
+//  - [X] read the buttons
+//  - [X] generate a state machine with the menu states
 //----------------------------------------------------------------------------
 #![deny(unsafe_code)]
 // #![deny(warnings)]
 #![no_main]
 #![no_std]
 
-mod button;
+mod buttons;
 mod datetime;
-mod logger;
-mod menu;
+mod io;
+mod ui;
 
-use menu::*;
-
+use crate::buttons::Button;
+use crate::io::Logger;
 use datetime::DateTime;
-extern crate panic_semihosting;
-// use core::fmt::Write;
-use cortex_m::peripheral::DWT;
-// TODO(elsuizo:2021-03-25): this is a mess
-use stm32f1xx_hal::{
-    gpio,
-    i2c::{BlockingI2c, DutyCycle, I2c, Mode},
-    pac,
-    prelude::*,
-    rtc::Rtc,
-    serial::{self, Config, Serial},
-    stm32,
-    time::Hertz,
-    timer,
-};
-
-use stm32f1xx_hal::gpio::{Output, State};
+use heapless::String;
+use panic_semihosting as _;
+use rtic::app;
+use stm32f1xx_hal::gpio::PinState;
+use stm32f1xx_hal::{gpio, pac, prelude::*};
 
 use core::fmt::Write;
-use embedded_graphics::{
-    fonts::{Font12x16, Text},
-    pixelcolor::BinaryColor,
-    prelude::*,
-    style::TextStyle,
-};
-use embedded_hal::digital::v2::OutputPin;
-use heapless::{consts::*, String};
+
 use pac::I2C1;
-use rtic::app;
-use rtic::cyccnt::{Instant, U32Ext};
-use sh1106::interface::{DisplayInterface, I2cInterface};
-use sh1106::mode::displaymode::DisplayModeTrait;
 use sh1106::{prelude::*, Builder};
+use stm32f1xx_hal::{
+    i2c::{BlockingI2c, DutyCycle, Mode},
+    rtc::Rtc,
+    serial::{Config, Serial},
+};
+use systick_monotonic::{fugit::Duration, Systick};
 
-type Led = gpio::gpioc::PC13<gpio::Output<gpio::PushPull>>;
-type Sda = gpio::gpiob::PB9<gpio::Alternate<gpio::OpenDrain>>;
-type Scl = gpio::gpiob::PB8<gpio::Alternate<gpio::OpenDrain>>;
-type Button0Pin = gpio::gpioa::PA6<gpio::Input<gpio::PullUp>>;
-type Button1Pin = gpio::gpioa::PA7<gpio::Input<gpio::PullUp>>;
-type Button2Pin = gpio::gpiob::PB0<gpio::Input<gpio::PullUp>>;
+#[app(device = stm32f1xx_hal::pac, peripherals = true, dispatchers = [SPI1])]
+mod app {
+    use super::*;
+    //-------------------------------------------------------------------------
+    //                        type alias
+    //-------------------------------------------------------------------------
+    type Led = gpio::gpioc::PC13<gpio::Output<gpio::PushPull>>;
+    type Sda = gpio::gpiob::PB9<gpio::Alternate<gpio::OpenDrain>>;
+    type Scl = gpio::gpiob::PB8<gpio::Alternate<gpio::OpenDrain>>;
+    type ButtonUpPin = gpio::gpioa::PA5<gpio::Input<gpio::PullUp>>;
+    type ButtonDownPin = gpio::gpioa::PA6<gpio::Input<gpio::PullUp>>;
+    type ButtonEnterPin = gpio::gpioa::PA7<gpio::Input<gpio::PullUp>>;
+    type OledDisplay = GraphicsMode<I2cInterface<BlockingI2c<I2C1, (Scl, Sda)>>>;
 
-type OledDisplay = GraphicsMode<I2cInterface<BlockingI2c<I2C1, (Scl, Sda)>>>;
-
-const PERIOD: u32 = 8_000_000; // period of periodic task execution
-
-#[app(device = stm32f1xx_hal::pac, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
-const APP: () = {
-    struct Resources {
+    #[monotonic(binds = SysTick, default = true)]
+    type MonoTimer = Systick<1000>;
+    //-------------------------------------------------------------------------
+    //                        resources declaration
+    //-------------------------------------------------------------------------
+    // Resources shared between tasks
+    #[shared]
+    struct Shared {
         led: Led,
-        display: OledDisplay,
-        rtc: Rtc,
-        logger: logger::Logger,
-        button0: button::Button<Button0Pin>,
-        timer: timer::CountDownTimer<stm32::TIM3>,
-        display_fsm: menu::DisplayStateMachine,
     }
 
-    #[init(schedule=[rtc_test])]
-    fn init(cx: init::Context) -> init::LateResources {
-        let mut core = cx.core;
-        core.DWT.enable_cycle_counter();
-        // cx.core.DCB.enable_trace();
-        let mut flash = cx.device.FLASH.constrain();
-        let mut rcc = cx.device.RCC.constrain();
-        let mut afio = cx.device.AFIO.constrain(&mut rcc.apb2);
+    #[local]
+    struct Local {
+        button_up: Button<ButtonUpPin>,
+        button_down: Button<ButtonDownPin>,
+        button_enter: Button<ButtonEnterPin>,
+        rtc: Rtc,
+        display: OledDisplay,
+        logger: Logger,
+        clock_fsm: crate::ui::ClockFSM,
+    }
+
+    //-------------------------------------------------------------------------
+    //                        initialization fn
+    //-------------------------------------------------------------------------
+    #[init]
+    fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
+        //-------------------------------------------------------------------------
+        //                        hardware initialization
+        //-------------------------------------------------------------------------
+        let rcc = cx.device.RCC.constrain();
         let mut pwr = cx.device.PWR;
-        let mut backup_domain = rcc.bkp.constrain(cx.device.BKP, &mut rcc.apb1, &mut pwr);
+        let mut flash = cx.device.FLASH.constrain();
+        // let clocks = rcc.cfgr.freeze(&mut flash.acr);
         let clocks = rcc
             .cfgr
-            .use_hse(8.mhz())
-            .sysclk(72.mhz())
-            .pclk1(36.mhz())
+            .use_hse(8.MHz())
+            .sysclk(36.MHz())
+            .pclk1(36.MHz())
             .freeze(&mut flash.acr);
-        let mut gpioa = cx.device.GPIOA.split(&mut rcc.apb2);
-        let mut gpiob = cx.device.GPIOB.split(&mut rcc.apb2);
-        let mut gpioc = cx.device.GPIOC.split(&mut rcc.apb2);
-        // oled pins
-        let scl = gpiob.pb8.into_alternate_open_drain(&mut gpiob.crh);
-        let sda = gpiob.pb9.into_alternate_open_drain(&mut gpiob.crh);
+
+        // let clocks = rcc
+        //     .cfgr
+        //     .use_hse(8.MHz())
+        //     .sysclk(72.MHz())
+        //     .pclk1(36.MHz())
+        //     .freeze(&mut flash.acr);
+        let mut afio = cx.device.AFIO.constrain();
+        let mut backup_domain = rcc.bkp.constrain(cx.device.BKP, &mut pwr);
+
+        let mut gpioa = cx.device.GPIOA.split();
+        let mut gpiob = cx.device.GPIOB.split();
+        let mut gpioc = cx.device.GPIOC.split();
+        let led = gpioc
+            .pc13
+            .into_push_pull_output_with_state(&mut gpioc.crh, PinState::Low);
+
         // USART1
         let tx = gpiob.pb6.into_alternate_push_pull(&mut gpiob.crl);
         let rx = gpiob.pb7;
-        // Set up the usart device. Taks ownership over the USART register and tx/rx pins. The rest of
-        // the registers are used to enable and configure the device.
-        let mut serial = Serial::usart1(
+        let serial = Serial::new(
             cx.device.USART1,
             (tx, rx),
             &mut afio.mapr,
             Config::default().baudrate(9600.bps()),
-            clocks,
-            &mut rcc.apb2,
+            &clocks,
         );
-        let mut led = gpioc
-            .pc13
-            .into_push_pull_output_with_state(&mut gpioc.crh, State::Low);
-        led.set_high().unwrap();
-
-        // timer setup
-        let mut timer =
-            timer::Timer::tim3(cx.device.TIM3, &clocks, &mut rcc.apb1).start_count_down(1.khz());
-        timer.listen(timer::Event::Update);
-
-        // display setup
+        let tx = serial.split().0;
+        let logger = Logger::new(tx);
+        // oled display pins
+        let scl = gpiob.pb8.into_alternate_open_drain(&mut gpiob.crh);
+        let sda = gpiob.pb9.into_alternate_open_drain(&mut gpiob.crh);
         let i2c = BlockingI2c::i2c1(
             cx.device.I2C1,
             (scl, sda),
             &mut afio.mapr,
             Mode::Fast {
-                frequency: 400_000.hz(),
+                frequency: 100.kHz(),
                 duty_cycle: DutyCycle::Ratio2to1,
             },
             clocks,
-            &mut rcc.apb1,
             1000,
             10,
             1000,
             1000,
         );
-        let mut display: GraphicsMode<_> = Builder::new().connect_i2c(i2c).into();
-        display.init().unwrap();
-        display.flush().unwrap();
 
-        // real time clock initialization
-        let mut rtc = Rtc::rtc(cx.device.RTC, &mut backup_domain);
+        //-------------------------------------------------------------------------
+        //                        rtic initialization
+        //-------------------------------------------------------------------------
+        let mut display: GraphicsMode<_> = Builder::new().connect_i2c(i2c).into();
+        display.init().ok();
+        display.flush().ok();
+        let systick = cx.core.SYST;
+        // let mono = Systick::new(systick, 36_000_000);
+        let mono = Systick::new(systick, 8_000_000);
+
+        let button_up_pin = gpioa.pa5.into_pull_up_input(&mut gpioa.crl);
+        let button_down_pin = gpioa.pa6.into_pull_up_input(&mut gpioa.crl);
+        let button_enter_pin = gpioa.pa7.into_pull_up_input(&mut gpioa.crl);
+        let mut rtc = Rtc::new(cx.device.RTC, &mut backup_domain);
         let today = DateTime {
-            year: 2021,
+            year: 2023,
             month: 4,
-            day: 17,
-            hour: 17,
-            min: 24,
+            day: 11,
+            hour: 22,
+            min: 18,
             sec: 00,
             day_of_week: datetime::DayOfWeek::Saturday,
         };
@@ -159,69 +169,98 @@ const APP: () = {
 
         rtc.listen_seconds();
 
-        let tx = serial.split().0;
-        let mut logger = logger::Logger::new(tx);
-        cx.schedule.rtc_test(cx.start + PERIOD.cycles()).unwrap();
+        // NOTE(elsuizo:2021-11-24): here we dont need a super fast spawn(for the inititlization...)!!!
+        // NOTE(elsuizo: 2023-04-11): this is one second
+        react::spawn_after(Duration::<u64, 1, 1000>::from_ticks(1000)).unwrap();
 
-        // buttons
-        let button0_pin = gpioa.pa6.into_pull_up_input(&mut gpioa.crl);
-        let button1_pin = gpioa.pa7.into_pull_up_input(&mut gpioa.crl);
-        let button2_pin = gpiob.pb0.into_pull_up_input(&mut gpiob.crl);
+        (
+            Shared { led },
+            Local {
+                button_up: Button::new(button_up_pin),
+                button_down: Button::new(button_down_pin),
+                button_enter: Button::new(button_enter_pin),
+                rtc,
+                display,
+                logger,
+                clock_fsm: crate::ui::ClockFSM::init(crate::ui::ClockState::Time),
+            },
+            init::Monotonics(mono),
+        )
+    }
 
-        let display_fsm = DisplayStateMachine::init(DisplayState::Row1);
-        // resources
-        init::LateResources {
-            led,
-            display,
-            rtc,
-            logger,
-            button0: button::Button::new(button0_pin),
-            timer,
-            display_fsm,
+    //-------------------------------------------------------------------------
+    //                        tasks
+    //-------------------------------------------------------------------------
+    #[idle]
+    fn idle(_: idle::Context) -> ! {
+        loop {
+            continue;
         }
     }
+    // NOTE(elsuizo:2021-11-24): the maximum period of this periodic task for a responsive button
+    // action is 13 ms
+    // NOTE(elsuizo:2021-11-21): remember that the method set_low() needs the trait: `use embedded_hal::digital::v2::OutputPin;`
+    // to be used!!!
+    #[task(local = [button_up, button_down, button_enter], shared = [led])]
+    fn react(cx: react::Context) {
+        use crate::buttons::PinState::*;
+        use crate::ui::ClockState::*;
+        use crate::ui::Msg::*;
 
-    #[task(binds = TIM3, priority = 4, spawn = [ui], resources = [button0, timer])]
-    fn tick(c: tick::Context) {
-        c.resources.timer.clear_update_interrupt_flag();
-
-        if let button::Event::Pressed = c.resources.button0.poll() {
-            c.spawn.ui(menu::Message::Down);
+        if let PinUp = cx.local.button_up.poll() {
+            dispatch_msg::spawn(Up).ok();
         }
-    }
+        if let PinUp = cx.local.button_down.poll() {
+            dispatch_msg::spawn(Down).ok();
+        }
 
-    #[task(resources=[display_fsm])]
-    fn ui(c: ui::Context, msg: menu::Message) {
-        c.resources.display_fsm.dispatch(msg);
-    }
+        if let Nothing = cx.local.button_up.poll() {
+            dispatch_msg::spawn(Continue).ok();
+        }
 
-    #[task(resources=[led, logger, rtc, display], schedule=[rtc_test])]
-    fn rtc_test(c: rtc_test::Context) {
-        // c.resources.rtc.clear_second_flag();
-        // c.resources.rtc.listen_seconds();
+        if let Nothing = cx.local.button_down.poll() {
+            dispatch_msg::spawn(Continue).ok();
+        }
 
-        // if *LED_STATE {
-        //     c.resources.led.set_high().unwrap();
-        //     *LED_STATE = false;
-        // } else {
-        //     c.resources.led.set_low().unwrap();
-        //     *LED_STATE = true;
+        // if let PinUp = cx.local.button_enter.poll() {
+        //     dispatch_msg::spawn(Enter).ok();
         // }
-        let mut out: String<U256> = String::new();
-        let datetime = DateTime::new(c.resources.rtc.current_time());
-        write!(&mut out, "{}", datetime).unwrap();
-        Text::new(&out, Point::new(0, 4))
-            .into_styled(TextStyle::new(Font12x16, BinaryColor::On))
-            .draw(c.resources.display)
-            .unwrap();
-        c.resources.display.flush().unwrap();
-        c.resources.display.clear();
-        c.resources.logger.log(&out);
+        react::spawn_after(Duration::<u64, 1, 1000>::from_ticks(10)).unwrap();
+    }
 
-        c.schedule.rtc_test(c.scheduled + PERIOD.cycles()).unwrap();
+    #[task(local = [display, logger, clock_fsm, rtc], shared = [led])]
+    fn dispatch_msg(cx: dispatch_msg::Context, msg: crate::ui::Msg) {
+        use crate::ui::Msg::*;
+        let dispatch_msg::SharedResources { mut led } = cx.shared;
+        cx.local.display.clear();
+        cx.local.clock_fsm.next_state(msg);
+        match msg {
+            Up => {
+                led.lock(|l| l.toggle());
+                let mut time: String<256> = String::new();
+                let datetime = DateTime::new(cx.local.rtc.current_time());
+                write!(&mut time, "{}", datetime).unwrap();
+                cx.local.logger.log("button Up pressed!!!").ok();
+                crate::ui::draw_menu(cx.local.display, cx.local.clock_fsm.state, Some(&time)).ok();
+                cx.local.display.flush().unwrap();
+            }
+            Down => {
+                led.lock(|l| l.toggle());
+                cx.local.logger.log("button Down pressed!!!").ok();
+                let mut time: String<256> = String::new();
+                let datetime = DateTime::new(cx.local.rtc.current_time());
+                write!(&mut time, "{}", datetime).unwrap();
+                crate::ui::draw_menu(cx.local.display, cx.local.clock_fsm.state, Some(&time)).ok();
+                cx.local.display.flush().unwrap();
+            }
+            Continue => {
+                // led.lock(|l| l.toggle());
+                let mut time: String<256> = String::new();
+                let datetime = DateTime::new(cx.local.rtc.current_time());
+                write!(&mut time, "{}", datetime).unwrap();
+                crate::ui::draw_menu(cx.local.display, cx.local.clock_fsm.state, Some(&time)).ok();
+                cx.local.display.flush().unwrap();
+            }
+        };
     }
-    // Interrupt handlers used to dispatch software tasks
-    extern "C" {
-        fn EXTI2();
-    }
-};
+}
